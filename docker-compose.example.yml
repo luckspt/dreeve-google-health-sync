@@ -13,6 +13,7 @@ services:
       GHEALTH_CLIENT_SECRET: ${GHEALTH_CLIENT_SECRET}
       LOOKBACK_DAYS: ${LOOKBACK_DAYS:-30}
       SYNC_INTERVAL_SECONDS: ${SYNC_INTERVAL_SECONDS:-3600}
+      NON_GPS_TYPES: ${NON_GPS_TYPES:-PADEL}
     volumes:
       - ./watch:/watch                 # same folder Dreeve's daemon watches
       - ./google-health-token:/data    # persists token.json + export state

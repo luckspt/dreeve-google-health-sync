@@ -29,6 +29,9 @@ that returns exactly the file format Dreeve imports.
 - A small Python script (run via [`uv`](https://docs.astral.sh/uv/), no
   dependencies) calls the Google Health API for exercises in a given window,
   and for anything with `hasGps: true`, exports it as TCX.
+- Non-GPS workouts whose type is listed in `NON_GPS_TYPES` (default:
+  `PADEL`) are exported too, as a summary TCX built from the exercise record
+  (see [Non-GPS workouts](#non-gps-workouts-eg-padel)).
 - It wraps [`ghealth`](https://github.com/rudrankriyam/Google-Health-CLI),
   an open-source CLI for the Google Health API, for the actual REST/OAuth
   plumbing.
@@ -106,6 +109,7 @@ docker compose up -d --build google-health-sync
 | `LOOKBACK_DAYS` | no | `30` | Rolling window checked on every sync |
 | `SYNC_INTERVAL_SECONDS` | no | `3600` | Delay between sync runs |
 | `FROM_DATE` / `TO_DATE` | no | -- | One-off backfill window (`YYYY-MM-DD`), overrides `LOOKBACK_DAYS` when set |
+| `NON_GPS_TYPES` | no | `PADEL` | Comma-separated Google Health `exerciseType`s to export even without GPS (e.g. `PADEL,TENNIS`). Set to `NONE` to disable |
 
 For a one-off historical backfill, run it manually instead of waiting for
 the loop:
@@ -115,11 +119,34 @@ docker compose run --rm -e FROM_DATE=2025-03-01 -e TO_DATE=2025-07-01 google-hea
     uv run --script /app/sync.py
 ```
 
+## Non-GPS workouts (e.g. Padel)
+
+Google's `exportExerciseTcx` returns an empty shell (no laps, no
+trackpoints) for exercises without GPS, which Dreeve can't import. For types
+listed in `NON_GPS_TYPES`, the script instead builds a TCX from the
+exercise's own summary:
+
+- `Sport` is set to Dreeve's sport name (`PADEL` -> `Padel`, `TENNIS` ->
+  `Tennis`, ...), so it shows up with the right sport type in Dreeve.
+- One lap with the active duration, total distance, calories and average
+  heart rate.
+- Synthetic trackpoints every 30s spanning the session, with linearly
+  interpolated distance and the *average* heart rate -- so the heart-rate
+  chart in Dreeve is flat and max HR equals average HR. Per-second heart
+  rate would need the extra `health_metrics_and_measurements` scope.
+
+Activities exported by previous versions of this tool are tracked in a
+separate `legacy` list in `exported_ids.json` (older versions also recorded
+*skipped* non-GPS activities there), so Padel sessions that were skipped in
+the past are still picked up by the rolling window or a `FROM_DATE`
+backfill.
+
 ## Notes and limitations
 
-- Only exercises with `hasGps: true` are exported -- passive/auto-detected
-  activity (e.g. background step-counted walks) has no route data at all,
-  by Health Connect's own design, and is skipped.
+- Only exercises with `hasGps: true`, or whose type is in `NON_GPS_TYPES`,
+  are exported -- passive/auto-detected activity (e.g. background
+  step-counted walks) has no route data at all, by Health Connect's own
+  design, and is skipped.
 - Query windows are automatically chunked at 90 days, the API's per-request
   limit for the `exercise` data type.
 - Exported activity IDs are tracked in `TOKEN_DIR/exported_ids.json` so

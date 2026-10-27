@@ -7,6 +7,11 @@
 Pull GPS-tracked exercises from the Google Health API and drop them as TCX
 files into Dreeve's watch folder for automatic import.
 
+Non-GPS exercise types listed in NON_GPS_TYPES (default: PADEL) are exported
+too. Google's export-tcx returns an empty shell for those, so a summary TCX
+(duration, distance, calories, average heart rate) is generated from the
+exercise record instead.
+
 Wraps the `ghealth` CLI (https://github.com/rudrankriyam/Google-Health-CLI)
 for the actual REST calls; this script handles token refresh, date
 windowing (the API caps a single query at 90 days), state tracking to
@@ -24,6 +29,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from xml.sax.saxutils import escape
 
 GHEALTH_BIN = os.environ.get("GHEALTH_BIN", "/usr/local/bin/ghealth")
 GHEALTH_HOME = Path(os.environ.get("GHEALTH_HOME", "/tmp/ghealth-home"))
@@ -35,9 +41,35 @@ CLIENT_SECRET = os.environ.get("GHEALTH_CLIENT_SECRET")
 LOOKBACK_DAYS = int(os.environ.get("LOOKBACK_DAYS", "30"))
 FROM_DATE = os.environ.get("FROM_DATE")  # optional explicit backfill window
 TO_DATE = os.environ.get("TO_DATE")
+# Google Health exerciseType values to export even without GPS, comma-separated.
+NON_GPS_TYPES = {
+    t.strip().upper()
+    for t in os.environ.get("NON_GPS_TYPES", "PADEL").split(",")
+    if t.strip()
+}
 
 MAX_QUERY_DAYS = 90  # API limit for the "exercise" data type
 TOKEN_URL = "https://oauth2.googleapis.com/token"
+
+# Google Health exerciseType -> TCX Sport attribute. Dreeve resolves these
+# names to its own sport types (see its SportType enum); anything it doesn't
+# recognise is imported as a generic "Workout".
+SPORT_NAMES = {
+    "PADEL": "Padel",
+    "TENNIS": "Tennis",
+    "SQUASH": "Squash",
+    "BADMINTON": "Badminton",
+    "TABLE_TENNIS": "TableTennis",
+    "PICKLEBALL": "Pickleball",
+    "PICKELBALL": "Pickleball",  # sic -- that's how the API spells it
+    "RACQUETBALL": "Racquetball",
+    "WEIGHTLIFTING": "WeightTraining",
+    "STRENGTH_TRAINING": "WeightTraining",
+    "HIIT": "HIIT",
+    "YOGA": "Yoga",
+}
+# Dreeve treats gaps > 60s between trackpoints as pauses, so keep them closer.
+SYNTHETIC_TRACKPOINT_INTERVAL_S = 30
 
 logging.basicConfig(
     level=logging.INFO,
@@ -111,13 +143,25 @@ def run_ghealth(*args):
 
 
 def load_state():
-    if STATE_FILE.exists():
-        return set(json.loads(STATE_FILE.read_text()))
-    return set()
+    """Returns (processed_ids, legacy_ids).
+
+    `legacy` holds IDs written by older versions, which marked skipped non-GPS
+    activities as processed too. They're kept apart so activities of a newly
+    enabled NON_GPS_TYPES type can still be exported (incl. via backfills)."""
+    if not STATE_FILE.exists():
+        return set(), set()
+    data = json.loads(STATE_FILE.read_text())
+    if isinstance(data, list):
+        return set(), set(data)
+    return set(data.get("processed", [])), set(data.get("legacy", []))
 
 
-def save_state(ids):
-    STATE_FILE.write_text(json.dumps(sorted(ids)))
+def save_state(processed, legacy):
+    STATE_FILE.write_text(json.dumps({
+        "version": 2,
+        "processed": sorted(processed),
+        "legacy": sorted(legacy - processed),
+    }))
 
 
 def list_exercises_window(since_dt, until_dt):
@@ -170,47 +214,129 @@ def export_tcx(point_id):
     return run_ghealth("data", "export-tcx", f"users/me/dataTypes/exercise/dataPoints/{point_id}")
 
 
+def _parse_time(value):
+    return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
+
+
+def _parse_duration(value):
+    """Google duration strings look like "4800s" / "12.5s"."""
+    return float(str(value).rstrip("s")) if value else None
+
+
+def _tcx_time(dt):
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def build_summary_tcx(point):
+    """Build a TCX for an exercise without GPS from its summary metrics.
+
+    Produces a single lap with evenly spaced trackpoints carrying linearly
+    interpolated distance and the session's average heart rate, which is the
+    shape Dreeve's TCX parser needs to pick up duration, distance, calories
+    and heart rate."""
+    exercise = point.get("exercise", {})
+    interval = exercise.get("interval", {})
+    start = _parse_time(interval["startTime"])
+    end = _parse_time(interval["endTime"])
+    elapsed = max((end - start).total_seconds(), 1.0)
+    active = _parse_duration(exercise.get("activeDuration")) or elapsed
+
+    summary = exercise.get("metricsSummary", {})
+    distance_m = (summary.get("distanceMillimeters") or 0) / 1000
+    calories = int(round(float(summary.get("caloriesKcal") or 0)))
+    avg_hr = summary.get("averageHeartRateBeatsPerMinute")
+    avg_hr = int(avg_hr) if avg_hr else None
+
+    ex_type = exercise.get("exerciseType", "")
+    sport = SPORT_NAMES.get(ex_type, ex_type.replace("_", " ").title().replace(" ", "") or "Other")
+    device = point.get("dataSource", {}).get("device", {}).get("displayName", "Google Health")
+
+    offsets = list(range(0, int(elapsed), SYNTHETIC_TRACKPOINT_INTERVAL_S)) + [int(elapsed)]
+    trackpoints = []
+    for offset in offsets:
+        tp = [f"<Time>{_tcx_time(start + timedelta(seconds=offset))}</Time>"]
+        tp.append(f"<DistanceMeters>{distance_m * offset / elapsed:.1f}</DistanceMeters>")
+        if avg_hr:
+            tp.append(f"<HeartRateBpm><Value>{avg_hr}</Value></HeartRateBpm>")
+        trackpoints.append("            <Trackpoint>" + "".join(tp) + "</Trackpoint>")
+
+    hr_lap = f"\n        <AverageHeartRateBpm><Value>{avg_hr}</Value></AverageHeartRateBpm>" if avg_hr else ""
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<TrainingCenterDatabase xmlns="http://www.garmin.com/xmlschemas/TrainingCenterDatabase/v2">
+  <Activities>
+    <Activity Sport="{escape(sport)}">
+      <Id>{_tcx_time(start)}</Id>
+      <Lap StartTime="{_tcx_time(start)}">
+        <TotalTimeSeconds>{active:.0f}</TotalTimeSeconds>
+        <DistanceMeters>{distance_m:.1f}</DistanceMeters>
+        <Calories>{calories}</Calories>{hr_lap}
+        <Intensity>Active</Intensity>
+        <TriggerMethod>Manual</TriggerMethod>
+        <Track>
+{chr(10).join(trackpoints)}
+        </Track>
+      </Lap>
+      <Creator><Name>{escape(device)}</Name></Creator>
+    </Activity>
+  </Activities>
+</TrainingCenterDatabase>
+"""
+
+
 def main():
     require_config()
     token = refresh_access_token()
     setup_ghealth_home(token)
 
-    processed = load_state()
+    processed, legacy = load_state()
     start, end = resolve_range()
     points = list_exercises_range(start, end)
 
     new_count = 0
     for point in points:
         point_id = point["name"].rsplit("/", 1)[-1]
+        exercise = point.get("exercise", {})
+        has_gps = exercise.get("exerciseMetadata", {}).get("hasGps", False)
+        is_non_gps_type = not has_gps and exercise.get("exerciseType", "").upper() in NON_GPS_TYPES
+
         if point_id in processed:
             continue
-
-        has_gps = point.get("exercise", {}).get("exerciseMetadata", {}).get("hasGps", False)
-        if not has_gps:
-            processed.add(point_id)
-            save_state(processed)
+        if point_id in legacy and not is_non_gps_type:
             continue
 
-        try:
-            tcx = export_tcx(point_id)
-        except RuntimeError as e:
-            logging.warning(f"skip {point_id}: {e}")
+        if not has_gps and not is_non_gps_type:
+            # Not recorded in state: the decision is free to re-make, and this
+            # lets activities be picked up later if NON_GPS_TYPES changes.
             continue
 
-        if "<Trackpoint>" not in tcx:
-            processed.add(point_id)
-            save_state(processed)
-            continue
+        if is_non_gps_type:
+            try:
+                tcx = build_summary_tcx(point)
+            except (KeyError, ValueError) as e:
+                logging.warning(f"skip {point_id}: cannot build summary TCX: {e}")
+                continue
+        else:
+            try:
+                tcx = export_tcx(point_id)
+            except RuntimeError as e:
+                logging.warning(f"skip {point_id}: {e}")
+                continue
+
+            if "<Trackpoint>" not in tcx:
+                processed.add(point_id)
+                save_state(processed, legacy)
+                continue
 
         filename = safe_filename(point)
         WATCH_DIR.mkdir(parents=True, exist_ok=True)
         (WATCH_DIR / filename).write_text(tcx)
 
         processed.add(point_id)
-        save_state(processed)
+        save_state(processed, legacy)
         new_count += 1
         logging.info(f"exported {filename}")
 
+    save_state(processed, legacy)  # also migrates the old list-only format
     logging.info(f"done: {new_count} new TCX file(s) written")
 
 
