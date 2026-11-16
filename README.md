@@ -64,6 +64,7 @@ recurring action.
 3. Go to **Data Access -> Add or Remove Scopes** and add:
    - `https://www.googleapis.com/auth/googlehealth.activity_and_fitness.readonly`
    - `https://www.googleapis.com/auth/googlehealth.location.readonly`
+   - `https://www.googleapis.com/auth/googlehealth.health_metrics_and_measurements.readonly`
 4. Go to **Clients -> Create Client**, type **Desktop app**, and note the
    Client ID and Client Secret.
 
@@ -128,12 +129,12 @@ exercise's own summary:
 
 - `Sport` is set to Dreeve's sport name (`PADEL` -> `Padel`, `TENNIS` ->
   `Tennis`, ...), so it shows up with the right sport type in Dreeve.
-- One lap with the active duration, total distance, calories and average
-  heart rate.
+- One lap with the active duration, total distance, calories, average
+  heart rate, and maximum heart rate.
 - Synthetic trackpoints every 30s spanning the session, with linearly
-  interpolated distance and the *average* heart rate -- so the heart-rate
-  chart in Dreeve is flat and max HR equals average HR. Per-second heart
-  rate would need the extra `health_metrics_and_measurements` scope.
+  interpolated distance and per-sample heart rate matched from Google Health's
+  `heart-rate` stream (falling back to the session's average heart rate if the
+  token doesn't have the `health_metrics_and_measurements.readonly` scope).
 
 Activities exported by previous versions of this tool are tracked in a
 separate `legacy` list in `exported_ids.json` (older versions also recorded

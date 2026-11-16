@@ -38,6 +38,7 @@ SCOPES = [
     "https://www.googleapis.com/auth/googlehealth.profile.readonly",
     "https://www.googleapis.com/auth/googlehealth.activity_and_fitness.readonly",
     "https://www.googleapis.com/auth/googlehealth.location.readonly",
+    "https://www.googleapis.com/auth/googlehealth.health_metrics_and_measurements.readonly",
 ]
 
 received = {}

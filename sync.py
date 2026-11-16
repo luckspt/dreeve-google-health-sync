@@ -19,10 +19,12 @@ avoid re-exporting the same activity, and writing into the shared volume.
 
 Configuration is entirely via environment variables -- see README.md.
 """
+import bisect
 import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import urllib.parse
@@ -31,7 +33,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from xml.sax.saxutils import escape
 
-GHEALTH_BIN = os.environ.get("GHEALTH_BIN", "/usr/local/bin/ghealth")
+GHEALTH_BIN = os.environ.get("GHEALTH_BIN") or shutil.which("ghealth") or "/usr/local/bin/ghealth"
 GHEALTH_HOME = Path(os.environ.get("GHEALTH_HOME", "/tmp/ghealth-home"))
 TOKEN_DIR = Path(os.environ.get("TOKEN_DIR", "/data"))
 WATCH_DIR = Path(os.environ.get("WATCH_DIR", "/watch"))
@@ -70,6 +72,106 @@ SPORT_NAMES = {
 }
 # Dreeve treats gaps > 60s between trackpoints as pauses, so keep them closer.
 SYNTHETIC_TRACKPOINT_INTERVAL_S = 30
+HR_MATCH_TOLERANCE_S = 30
+
+
+def _avg_hr(point):
+    avg = point.get("exercise", {}).get("metricsSummary", {}).get("averageHeartRateBeatsPerMinute")
+    return int(round(float(avg))) if avg else None
+
+
+def list_heart_rate(start, end):
+    """Fetch heart-rate samples in [start, end] as sorted (timestamp_s, bpm) pairs.
+
+    Requires the health_metrics_and_measurements.readonly scope; returns []
+    if the token lacks that scope or the query fails."""
+    since = start.strftime("%Y-%m-%dT%H:%M:%SZ")
+    until = end.strftime("%Y-%m-%dT%H:%M:%SZ")
+    samples = []
+    page_token = None
+    try:
+        while True:
+            args = ["data", "list", "heart-rate", "--from", since, "--to", until, "--limit", "1000"]
+            if page_token:
+                args += ["--page-token", page_token]
+            data = json.loads(run_ghealth(*args))
+            for p in data.get("dataPoints", []):
+                hr = p.get("heartRate", {})
+                ts = hr.get("sampleTime", {}).get("physicalTime")
+                bpm = hr.get("beatsPerMinute")
+                if ts and bpm:
+                    samples.append((_parse_time(ts).timestamp(), int(round(float(bpm)))))
+            page_token = data.get("nextPageToken")
+            if not page_token:
+                break
+    except RuntimeError as e:
+        logging.warning(f"heart-rate query failed (falling back to summary HR): {e}")
+        return []
+    samples.sort()
+    return samples
+
+
+def _nearest_hr(ts, times, bpms, default=None):
+    if not times:
+        return default
+    idx = bisect.bisect_left(times, ts)
+    candidates = []
+    if idx < len(times):
+        candidates.append((abs(times[idx] - ts), bpms[idx]))
+    if idx > 0:
+        candidates.append((abs(times[idx - 1] - ts), bpms[idx - 1]))
+    dist, bpm = min(candidates)
+    return bpm if dist <= HR_MATCH_TOLERANCE_S else default
+
+
+def inject_heart_rate_tcx(tcx, point):
+    """Ensure a GPS TCX contains <HeartRateBpm> data.
+
+    Google's exportExerciseTcx includes heart rate when the OAuth token has
+    the health_metrics_and_measurements.readonly scope. If it is still missing,
+    splice in per-sample heart rate from the heart-rate endpoint (or fall back
+    to the exercise's summary averageHeartRateBeatsPerMinute)."""
+    if "<HeartRateBpm>" in tcx:
+        return tcx
+
+    interval = point.get("exercise", {}).get("interval", {})
+    avg_hr = _avg_hr(point)
+    samples = []
+    if "startTime" in interval and "endTime" in interval:
+        start = _parse_time(interval["startTime"]) - timedelta(seconds=HR_MATCH_TOLERANCE_S)
+        end = _parse_time(interval["endTime"]) + timedelta(seconds=HR_MATCH_TOLERANCE_S)
+        samples = list_heart_rate(start, end)
+
+    if not samples and not avg_hr:
+        return tcx
+
+    times = [s[0] for s in samples]
+    bpms = [s[1] for s in samples]
+    matched_bpms = []
+
+    def add_tp_hr(match):
+        block = match.group(0)
+        t_match = re.search(r"<Time>([^<]+)</Time>", block)
+        bpm = _nearest_hr(_parse_time(t_match.group(1)).timestamp(), times, bpms, avg_hr) if t_match else avg_hr
+        if not bpm:
+            return block
+        matched_bpms.append(bpm)
+        indent_m = re.search(r"\n([ \t]*)</Trackpoint>", block)
+        child_indent = (indent_m.group(1) + "    ") if indent_m else "                        "
+        hr_xml = f"\n{child_indent}<HeartRateBpm><Value>{bpm}</Value></HeartRateBpm>"
+        return re.sub(r"(\n[ \t]*</Trackpoint>)", hr_xml + r"\1", block, count=1)
+
+    tcx = re.sub(r"<Trackpoint>.*?</Trackpoint>", add_tp_hr, tcx, flags=re.DOTALL)
+
+    lap_avg = avg_hr or (int(round(sum(matched_bpms) / len(matched_bpms))) if matched_bpms else None)
+    lap_max = max(matched_bpms) if matched_bpms else lap_avg
+    if lap_avg and "<AverageHeartRateBpm>" not in tcx:
+        lap_hr = f"\n                <AverageHeartRateBpm><Value>{lap_avg}</Value></AverageHeartRateBpm>"
+        if lap_max:
+            lap_hr += f"\n                <MaximumHeartRateBpm><Value>{lap_max}</Value></MaximumHeartRateBpm>"
+        tcx = re.sub(r"(<Calories>\d+</Calories>)", r"\1" + lap_hr, tcx, count=1)
+
+    return tcx
 
 logging.basicConfig(
     level=logging.INFO,
@@ -120,18 +222,18 @@ def refresh_access_token():
 
 
 def setup_ghealth_home(token):
-    """ghealth reads ~/.config/ghealth/{config,token}.json; point $HOME at a
-    scratch dir we control so we don't need extra CLI flags."""
-    config_dir = GHEALTH_HOME / ".config/ghealth"
-    config_dir.mkdir(parents=True, exist_ok=True)
-
+    """Point $HOME at a scratch dir we control so we don't need extra CLI flags.
+    Writes to both Linux (~/.config) and macOS (~/Library/Application Support) paths."""
     config = {
         "baseURL": "https://health.googleapis.com",
         "user": "users/me",
         "clientID": CLIENT_ID,
     }
-    (config_dir / "config.json").write_text(json.dumps(config, indent=2))
-    (config_dir / "token.json").write_text(json.dumps(token, indent=2))
+    for rel_dir in (".config/ghealth", "Library/Application Support/ghealth"):
+        config_dir = GHEALTH_HOME / rel_dir
+        config_dir.mkdir(parents=True, exist_ok=True)
+        (config_dir / "config.json").write_text(json.dumps(config, indent=2))
+        (config_dir / "token.json").write_text(json.dumps(token, indent=2))
 
 
 def run_ghealth(*args):
@@ -228,12 +330,12 @@ def _tcx_time(dt):
 
 
 def build_summary_tcx(point):
-    """Build a TCX for an exercise without GPS from its summary metrics.
+    """Build a TCX for an exercise without GPS from its summary metrics
+    (and per-sample heart rate when available).
 
     Produces a single lap with evenly spaced trackpoints carrying linearly
-    interpolated distance and the session's average heart rate, which is the
-    shape Dreeve's TCX parser needs to pick up duration, distance, calories
-    and heart rate."""
+    interpolated distance and heart rate, which is the shape Dreeve's TCX
+    parser needs to pick up duration, distance, calories and heart rate."""
     exercise = point.get("exercise", {})
     interval = exercise.get("interval", {})
     start = _parse_time(interval["startTime"])
@@ -244,8 +346,14 @@ def build_summary_tcx(point):
     summary = exercise.get("metricsSummary", {})
     distance_m = (summary.get("distanceMillimeters") or 0) / 1000
     calories = int(round(float(summary.get("caloriesKcal") or 0)))
-    avg_hr = summary.get("averageHeartRateBeatsPerMinute")
-    avg_hr = int(avg_hr) if avg_hr else None
+    avg_hr = _avg_hr(point)
+
+    samples = list_heart_rate(
+        start - timedelta(seconds=HR_MATCH_TOLERANCE_S),
+        end + timedelta(seconds=HR_MATCH_TOLERANCE_S),
+    )
+    times = [s[0] for s in samples]
+    bpms = [s[1] for s in samples]
 
     ex_type = exercise.get("exerciseType", "")
     sport = SPORT_NAMES.get(ex_type, ex_type.replace("_", " ").title().replace(" ", "") or "Other")
@@ -253,14 +361,24 @@ def build_summary_tcx(point):
 
     offsets = list(range(0, int(elapsed), SYNTHETIC_TRACKPOINT_INTERVAL_S)) + [int(elapsed)]
     trackpoints = []
+    matched_bpms = []
     for offset in offsets:
-        tp = [f"<Time>{_tcx_time(start + timedelta(seconds=offset))}</Time>"]
+        tp_dt = start + timedelta(seconds=offset)
+        bpm = _nearest_hr(tp_dt.timestamp(), times, bpms, avg_hr)
+        tp = [f"<Time>{_tcx_time(tp_dt)}</Time>"]
         tp.append(f"<DistanceMeters>{distance_m * offset / elapsed:.1f}</DistanceMeters>")
-        if avg_hr:
-            tp.append(f"<HeartRateBpm><Value>{avg_hr}</Value></HeartRateBpm>")
+        if bpm:
+            tp.append(f"<HeartRateBpm><Value>{bpm}</Value></HeartRateBpm>")
+            matched_bpms.append(bpm)
         trackpoints.append("            <Trackpoint>" + "".join(tp) + "</Trackpoint>")
 
-    hr_lap = f"\n        <AverageHeartRateBpm><Value>{avg_hr}</Value></AverageHeartRateBpm>" if avg_hr else ""
+    lap_avg = avg_hr or (int(round(sum(matched_bpms) / len(matched_bpms))) if matched_bpms else None)
+    lap_max = max(matched_bpms) if matched_bpms else lap_avg
+    hr_lap = ""
+    if lap_avg:
+        hr_lap += f"\n        <AverageHeartRateBpm><Value>{lap_avg}</Value></AverageHeartRateBpm>"
+    if lap_max:
+        hr_lap += f"\n        <MaximumHeartRateBpm><Value>{lap_max}</Value></MaximumHeartRateBpm>"
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <TrainingCenterDatabase xmlns="http://www.garmin.com/xmlschemas/TrainingCenterDatabase/v2">
   <Activities>
@@ -326,6 +444,8 @@ def main():
                 processed.add(point_id)
                 save_state(processed, legacy)
                 continue
+
+            tcx = inject_heart_rate_tcx(tcx, point)
 
         filename = safe_filename(point)
         WATCH_DIR.mkdir(parents=True, exist_ok=True)
